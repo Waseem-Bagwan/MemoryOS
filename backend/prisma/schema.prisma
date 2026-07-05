@@ -1,0 +1,184 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────
+// USER
+// Every memory belongs to a user.
+// ─────────────────────────────────────────
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String   // bcrypt hashed
+  name      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memories       Memory[]
+  sessions       Session[]
+  decisionLogs   DecisionLog[]
+
+  @@map("users")
+}
+
+// ─────────────────────────────────────────
+// SESSION
+// A conversation session. Redis holds the
+// hot (active) session. Postgres holds the
+// permanent record.
+// ─────────────────────────────────────────
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  startedAt DateTime @default(now())
+  endedAt   DateTime?
+  isActive  Boolean  @default(true)
+  
+  // How many messages processed this session
+  messageCount Int @default(0)
+
+  memories     Memory[]
+  decisionLogs DecisionLog[]
+
+  @@map("sessions")
+}
+
+// ─────────────────────────────────────────
+// MEMORY
+// The metadata record for every memory.
+// The actual content lives in Cognee.
+// cogneeId links the two together.
+// ─────────────────────────────────────────
+model Memory {
+  id       String @id @default(cuid())
+  userId   String
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  sessionId String?
+  session   Session? @relation(fields: [sessionId], references: [id])
+
+  // The ID Cognee gave this memory when we called cognee.remember()
+  // This is how we link Postgres metadata ↔ Cognee content
+  cogneeId  String?  @unique
+
+  // What is this memory about?
+  content   String   // the original text that became this memory
+
+  // Memory classification (simplified: 4 types for MVP)
+  // profile    → who the user is ("I'm a developer", "I live in Bangalore")
+  // preference → what they like/dislike ("I prefer TypeScript", "I hate meetings")
+  // knowledge  → facts they know or shared ("JWT uses 3 parts", "Docker is a container tool")
+  // experience → things that happened ("I finished the MemoryOS project", "I got an internship")
+  type      MemoryType @default(knowledge)
+
+  // Lifecycle: where is this memory in its life?
+  // candidate  → just ingested, decision pending
+  // active     → stored and in use
+  // archived   → replaced by a newer memory (kept for history)
+  // forgotten  → soft deleted, will be pruned from Cognee
+  lifecycle LifecycleState @default(candidate)
+
+  // Importance score from the decision engine (0.0 to 1.0)
+  // Low score = more likely to be forgotten during decay passes
+  importance Float @default(0.5)
+
+  // Conflict tracking
+  // If this memory replaced another, we store what it replaced
+  replacesId    String?  // ID of the memory this one replaced
+  replacedById  String?  // ID of the memory that replaced this one
+
+  // Timestamps for decay logic
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  lastAccessedAt DateTime @default(now())
+
+  // Tags for flexible querying ("location", "preference", "tech-stack")
+  tags String[] @default([])
+
+  decisionLogs DecisionLog[]
+
+  @@map("memories")
+}
+
+// ─────────────────────────────────────────
+// DECISION LOG
+// Every single decision MemoryOS makes is
+// logged here. This is the EXPLAINABILITY
+// layer — what makes MemoryOS unique.
+// Judges will love this.
+// ─────────────────────────────────────────
+model DecisionLog {
+  id        String @id @default(cuid())
+  userId    String
+  user      User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  sessionId String?
+  session   Session? @relation(fields: [sessionId], references: [id])
+  
+  memoryId  String?
+  memory    Memory?  @relation(fields: [memoryId], references: [id])
+
+  // What came in
+  inputText String
+
+  // What the engine decided
+  action    DecisionAction  // STORE, UPDATE, MERGE, IGNORE, FORGET
+
+  // The full explanation (human-readable string)
+  reasoning String
+
+  // Raw LLM response stored for debugging
+  llmResponse Json?
+
+  // Pipeline timing (how long each stage took)
+  // Stored as JSON: { classify: 120, score: 45, conflict: 89, decide: 34 }
+  pipelineTiming Json?
+
+  // Total end-to-end latency in ms
+  totalLatencyMs Int?
+
+  // Importance score that was assigned
+  importance Float?
+
+  // Was there a conflict detected?
+  conflictDetected Boolean @default(false)
+  conflictWithId   String? // ID of the memory it conflicted with
+
+  createdAt DateTime @default(now())
+
+  @@map("decision_logs")
+}
+
+// ─────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────
+
+enum MemoryType {
+  profile     // who the user is
+  preference  // what they like/dislike
+  knowledge   // facts and information
+  experience  // things that happened
+}
+
+enum LifecycleState {
+  candidate  // just arrived, not yet stored
+  active     // stored and usable
+  archived   // replaced, kept for history
+  forgotten  // marked for deletion from Cognee
+}
+
+enum DecisionAction {
+  STORE   // new memory, didn't exist before
+  UPDATE  // replaced an existing conflicting memory
+  MERGE   // combined with an existing related memory
+  IGNORE  // not important enough to store
+  FORGET  // triggered deletion of an old memory
+}
