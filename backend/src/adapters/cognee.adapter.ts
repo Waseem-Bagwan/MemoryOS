@@ -1,17 +1,5 @@
-// Auth headers needed for Cloud:
-//   X-Api-Key: your-api-key
-//   X-Tenant-Id: your-tenant-id
-//
-// Real Cognee API endpoints (verified):
-//   POST   /api/v1/add           → ingest raw text into a dataset
-//   POST   /api/v1/cognify       → build knowledge graph from ingested data
-//   POST   /api/v1/search        → search memory
-//   GET    /api/v1/datasets      → list datasets
-//   DELETE /api/v1/datasets/{id} → delete a whole dataset
-// ─────────────────────────────────────────────────────────────
 import { env } from "../config/env";
 
-// Build headers for every Cognee Cloud request
 function buildHeaders(): Record<string, string> {
   return {
     "Content-Type": "application/json",
@@ -41,28 +29,24 @@ async function cogneeRequest<T>(
   return JSON.parse(text) as T;
 }
 
-// Each user gets their own dataset name so memories never mix
 function datasetName(userId: string): string {
   return `user_${userId}`;
 }
 
+function isDatasetNotFoundError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /404|DatasetNotFound|No datasets/i.test(message);
+}
+
 export const cogneeAdapter = {
-  // ─────────────────────────────────────────
-  // remember()
-  // Step 1: POST /api/v1/add    → send raw text
-  // Step 2: POST /api/v1/cognify → build knowledge graph
-  // Returns a data item ID we store in Postgres
-  // so we can delete this specific item later
-  // ─────────────────────────────────────────
+  // remember() — add text + cognify. Never throws — returns mock ID on failure.
   async remember(text: string, userId: string): Promise<string> {
     try {
-      // Step 1: Add the raw text
       const addResult = await cogneeRequest<unknown>("/api/v1/add", "POST", {
         data: text,
         dataset_name: datasetName(userId),
       });
 
-      // Extract the item ID from whatever shape Cognee returns
       let dataId = `item-${Date.now()}`;
       if (Array.isArray(addResult) && addResult.length > 0) {
         const first = addResult[0] as Record<string, string>;
@@ -72,26 +56,20 @@ export const cogneeAdapter = {
         dataId = r.id ?? r.data_id ?? dataId;
       }
 
-      // Step 2: Cognify — builds the knowledge graph in the background
-      await cogneeRequest<unknown>("/api/v1/cognify", "POST", {
+      // cognify runs async — catch separately so add() result is not lost
+      cogneeRequest<unknown>("/api/v1/cognify", "POST", {
         datasets: [datasetName(userId)],
-      });
+      }).catch((err) => console.warn("[Cognee] cognify failed (non-fatal):", err));
 
       return dataId;
     } catch (error) {
-      if (env.IS_DEV) {
-        console.warn("[Cognee] Not reachable in dev, using mock ID");
-        return `dev-mock-${Date.now()}`;
-      }
-      throw error;
+      // Never crash the pipeline — return a fallback ID
+      console.warn("[Cognee] remember() failed, using fallback ID:", error);
+      return `fallback-${Date.now()}`;
     }
   },
 
-  // ─────────────────────────────────────────
-  // recall()
-  // POST /api/v1/search
-  // search_type "CHUNKS" = raw matching text chunks
-  // ─────────────────────────────────────────
+  // recall() — search Cognee. Returns [] on any error including 404 (no dataset yet).
   async recall(
     query: string,
     userId: string,
@@ -106,39 +84,35 @@ export const cogneeAdapter = {
         relevance?: number;
       };
 
-      const result = await cogneeRequest<
-        SearchItem[] | { results: SearchItem[] }
-      >("/api/v1/search", "POST", {
-        query,
-        search_type: "CHUNKS",
-        datasets: [datasetName(userId)],
-        limit,
-      });
+      const result = await cogneeRequest<SearchItem[] | { results: SearchItem[] }>(
+        "/api/v1/search",
+        "POST",
+        {
+          query,
+          search_type: "CHUNKS",
+          datasets: [datasetName(userId)],
+          limit,
+        }
+      );
 
       const raw: SearchItem[] = Array.isArray(result)
         ? result
         : (result as { results: SearchItem[] }).results ?? [];
 
       return raw.map((r, i) => ({
-        id: r.id ?? `result-${i}`,
-        content: r.text ?? r.content ?? "",
-        score: r.score ?? r.relevance ?? 0,
+        id:      r.id      ?? `result-${i}`,
+        content: r.text    ?? r.content ?? "",
+        score:   r.score   ?? r.relevance ?? 0,
       }));
     } catch (error) {
-      if (env.IS_DEV) {
-        console.warn("[Cognee] recall failed in dev mode, returning []");
-        return [];
-      }
-      throw error;
+      // 404 = no dataset yet (new user) — completely normal, return empty
+      if (isDatasetNotFoundError(error)) return [];
+      console.warn("[Cognee] recall() failed, returning []:", error);
+      return [];  // never throw — caller gets empty results
     }
   },
 
-  // ─────────────────────────────────────────
-  // forget()
-  // Delete one specific item from a dataset.
-  // First looks up the dataset ID by name,
-  // then deletes the specific data item.
-  // ─────────────────────────────────────────
+  // forget() — delete one item. Silent on missing dataset.
   async forget(cogneeDataId: string, userId: string): Promise<void> {
     try {
       const datasets = await cogneeRequest<Array<{ id: string; name: string }>>(
@@ -147,65 +121,42 @@ export const cogneeAdapter = {
       );
 
       const dataset = datasets.find((d) => d.name === datasetName(userId));
-      if (!dataset) {
-        console.warn(`[Cognee] No dataset found for user ${userId}`);
-        return;
-      }
+      if (!dataset) return; // dataset doesn't exist — nothing to forget
 
       await cogneeRequest<unknown>(
         `/api/v1/datasets/${dataset.id}/data/${cogneeDataId}`,
         "DELETE"
       );
     } catch (error) {
-      if (env.IS_DEV) {
-        console.warn(`[Cognee] forget(${cogneeDataId}) failed in dev mode`);
-        return;
-      }
-      throw error;
+      if (isDatasetNotFoundError(error)) return;
+      console.warn("[Cognee] forget() failed (non-fatal):", error);
+      // non-fatal — Postgres still archives the memory record
     }
   },
 
-  // ─────────────────────────────────────────
-  // improve()
-  // Re-run cognify to strengthen relationships
-  // between existing memories.
-  // ─────────────────────────────────────────
+  // improve() — re-run cognify on dataset.
   async improve(userId: string): Promise<void> {
     try {
       await cogneeRequest<unknown>("/api/v1/cognify", "POST", {
         datasets: [datasetName(userId)],
       });
     } catch (error) {
-      if (env.IS_DEV) {
-        console.warn("[Cognee] improve() failed in dev mode");
-        return;
-      }
-      throw error;
+      console.warn("[Cognee] improve() failed (non-fatal):", error);
     }
   },
 
-  // ─────────────────────────────────────────
-  // forgetAll()
-  // Wipe the entire user dataset from Cognee.
-  // Called if user requests full memory reset.
-  // ─────────────────────────────────────────
+  // forgetAll() — delete entire user dataset.
   async forgetAll(userId: string): Promise<void> {
     try {
       const datasets = await cogneeRequest<Array<{ id: string; name: string }>>(
         "/api/v1/datasets",
         "GET"
       );
-
       const dataset = datasets.find((d) => d.name === datasetName(userId));
       if (!dataset) return;
-
       await cogneeRequest<unknown>(`/api/v1/datasets/${dataset.id}`, "DELETE");
     } catch (error) {
-      if (env.IS_DEV) {
-        console.warn("[Cognee] forgetAll() failed in dev mode");
-        return;
-      }
-      throw error;
+      console.warn("[Cognee] forgetAll() failed (non-fatal):", error);
     }
   },
 

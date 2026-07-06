@@ -168,56 +168,65 @@ export const memoryService = {
     query: string,
     maxTokens: number = 1500
   ): Promise<{ contextString: string; memoriesUsed: number; totalMemories: number }> {
-    // Get top memories by importance from Redis (fast path)
-    const topIds = await redisAdapter.getTopMemoryIds(userId, 15);
+    const empty = { contextString: "", memoriesUsed: 0, totalMemories: 0 };
 
-    // Also search Cognee for query-relevant memories
-    const cogneeResults = await cogneeAdapter.recall(query, userId, 10);
-    const cogneeIds = cogneeResults.map((r) => r.id);
+    try {
+      // Get top memories by importance from Redis (fast path)
+      const topIds = await redisAdapter.getTopMemoryIds(userId, 15).catch(() => [] as string[]);
 
-    // Combine + deduplicate
-    const allIds = [...new Set([...topIds, ...cogneeIds])];
+      // Also search Cognee for query-relevant memories
+      // Wrapped separately — Cognee 404 (no dataset yet) must not crash chat
+      const cogneeResults = await cogneeAdapter.recall(query, userId, 10).catch(() => [] as Array<{ id: string; content: string; score: number }>);
+      const cogneeIds = cogneeResults.map((r) => r.id);
 
-    // Fetch from Postgres
-    const memories = allIds.length > 0
-      ? await prisma.memory.findMany({
-          where: { userId, lifecycle: "active", id: { in: allIds } },
-          select: { content: true, type: true, importance: true },
-          orderBy: { importance: "desc" },
-        })
-      : await prisma.memory.findMany({
-          where: { userId, lifecycle: "active" },
-          orderBy: { importance: "desc" },
-          take: 10,
-          select: { content: true, type: true, importance: true },
-        });
+      // Combine + deduplicate
+      const allIds = [...new Set([...topIds, ...cogneeIds])];
 
-    // Group by type for cleaner LLM context
-    const grouped: Record<string, string[]> = {};
-    for (const m of memories) {
-      if (!grouped[m.type]) grouped[m.type] = [];
-      grouped[m.type].push(m.content);
-    }
+      // Fetch from Postgres
+      const memories = allIds.length > 0
+        ? await prisma.memory.findMany({
+            where: { userId, lifecycle: "active", id: { in: allIds } },
+            select: { content: true, type: true, importance: true },
+            orderBy: { importance: "desc" },
+          })
+        : await prisma.memory.findMany({
+            where: { userId, lifecycle: "active" },
+            orderBy: { importance: "desc" },
+            take: 10,
+            select: { content: true, type: true, importance: true },
+          });
 
-    let contextString = "## What I know about you:\n\n";
-    for (const [type, contents] of Object.entries(grouped)) {
-      contextString += `**${type.charAt(0).toUpperCase() + type.slice(1)}:**\n`;
-      contextString += contents.map((c) => `- ${c}`).join("\n");
-      contextString += "\n\n";
-    }
+      if (memories.length === 0) return empty;
 
-    // Trim to token budget (rough: 1 token ≈ 4 chars)
-    if (contextString.length > maxTokens * 4) {
-      contextString = contextString.substring(0, maxTokens * 4) + "\n...";
-    }
+      // Group by type for cleaner LLM context
+      const grouped: Record<string, string[]> = {};
+      for (const m of memories) {
+        if (!grouped[m.type]) grouped[m.type] = [];
+        grouped[m.type].push(m.content);
+      }
 
-    return {
-      contextString,
-      memoriesUsed: memories.length,
-      totalMemories: await prisma.memory.count({
+      let contextString = "## What I know about you:\n\n";
+      for (const [type, contents] of Object.entries(grouped)) {
+        contextString += `**${type.charAt(0).toUpperCase() + type.slice(1)}:**\n`;
+        contextString += contents.map((c) => `- ${c}`).join("\n");
+        contextString += "\n\n";
+      }
+
+      // Trim to token budget (rough: 1 token ≈ 4 chars)
+      if (contextString.length > maxTokens * 4) {
+        contextString = contextString.substring(0, maxTokens * 4) + "\n...";
+      }
+
+      const totalMemories = await prisma.memory.count({
         where: { userId, lifecycle: "active" },
-      }),
-    };
+      }).catch(() => memories.length);
+
+      return { contextString, memoriesUsed: memories.length, totalMemories };
+    } catch (err) {
+      // Never let context building crash the chat
+      console.warn("[MemoryService] buildAgentContext failed, continuing without context:", err);
+      return empty;
+    }
   },
 
   // ─────────────────────────────────────────

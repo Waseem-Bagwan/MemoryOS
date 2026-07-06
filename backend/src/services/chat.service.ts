@@ -1,3 +1,20 @@
+// ─────────────────────────────────────────────────────────────
+// services/chat.service.ts
+//
+// This is what makes MemoryOS a real AI assistant, not just
+// a memory storage system.
+//
+// Every chat message goes through this flow:
+//
+// 1. Build memory context (what does the agent know about this user?)
+// 2. Call OpenAI with that context injected into system prompt
+// 3. Return the AI response to the frontend
+// 4. In the background: ingest the user message into memory
+//
+// The key insight: step 4 runs AFTER we return the response.
+// This means the user gets a fast reply, and memory processing
+// happens asynchronously. No waiting for Cognee.
+// ─────────────────────────────────────────────────────────────
 import OpenAI from "openai";
 import { env } from "../config/env";
 import { memoryService } from "./memory.service";
@@ -24,16 +41,16 @@ export const chatService = {
     sessionId: string
   ): Promise<ChatResponse> {
 
-    // ─────────────────────────────────────────
-    // Step 1: Build memory context
-    // What does the agent know about this user?
-    // This is the core MemoryOS value-add.
-    // ─────────────────────────────────────────
-    const { contextString, memoriesUsed } = await memoryService.buildAgentContext(
-      userId,
-      userMessage,
-      1500
-    );
+    // Step 1: Build memory context — wrapped so chat never fails if this throws
+    let contextString = "";
+    let memoriesUsed  = 0;
+    try {
+      const ctx = await memoryService.buildAgentContext(userId, userMessage, 1500);
+      contextString = ctx.contextString;
+      memoriesUsed  = ctx.memoriesUsed;
+    } catch (err) {
+      console.warn("[Chat] buildAgentContext failed, continuing without context:", err);
+    }
 
     // ─────────────────────────────────────────
     // Step 2: Get recent session history from Redis
@@ -52,19 +69,19 @@ export const chatService = {
     const systemPrompt = memoriesUsed > 0
       ? `You are a helpful AI assistant with persistent memory.
 
-        You remember things about this user from previous conversations.
-        Use this knowledge naturally in your responses — don't announce that you're using memory,
-        just respond as if you naturally know these things.
+You remember things about this user from previous conversations.
+Use this knowledge naturally in your responses — don't announce that you're using memory,
+just respond as if you naturally know these things.
 
-        ${contextString}
+${contextString}
 
-        Guidelines:
-        - Be conversational and warm
-        - Reference what you know about the user when relevant
-        - If the user shares new information, acknowledge it naturally
-        - Keep responses concise unless the user asks for detail`
-            : `You are a helpful AI assistant. Be conversational and warm.
-        Keep responses concise unless the user asks for detail.`;
+Guidelines:
+- Be conversational and warm
+- Reference what you know about the user when relevant
+- If the user shares new information, acknowledge it naturally
+- Keep responses concise unless the user asks for detail`
+      : `You are a helpful AI assistant. Be conversational and warm.
+Keep responses concise unless the user asks for detail.`;
 
     const response = await openai.chat.completions.create({
       model: "gpt-4o-mini",
