@@ -10,7 +10,7 @@ import { useQuery } from "@tanstack/react-query";
 import { memoryApi } from "../../api";
 
 const navItems = [
-  { to: "/",         icon: LayoutDashboard, label: "Dashboard" },
+  { to: "/dashboard", icon: LayoutDashboard, label: "Dashboard" },
   { to: "/chat",     icon: MessageSquare,   label: "Chat"      },
   { to: "/memories", icon: Brain,           label: "Memories", badge: true },
   { to: "/timeline", icon: Clock,           label: "Timeline"  },
@@ -51,7 +51,7 @@ export function Sidebar() {
       {/* Nav */}
       <nav className="flex-1 p-3 space-y-0.5">
         {navItems.map(({ to, icon: Icon, label, badge }) => (
-          <NavLink key={to} to={to} end={to === "/"}>
+          <NavLink key={to} to={to} end={to === "/dashboard"}>
             {({ isActive }) => (
               <motion.div
                 whileHover={{ x: 2 }}
